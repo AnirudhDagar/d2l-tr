@@ -825,7 +825,419 @@ def load_data_nmt(batch_size, num_steps, num_examples=600):
     tgt_array, tgt_valid_len = build_array_nmt(target, tgt_vocab, num_steps)
     data_arrays = (src_array, src_valid_len, tgt_array, tgt_valid_len)
     data_iter = d2l.load_array(data_arrays, batch_size)
-    return data_iter, src_vocab, tgt_vocab# Alias defined in config.ini
+    return data_iter, src_vocab, tgt_vocab
+
+def show_heatmaps(matrices, xlabel, ylabel, titles=None, figsize=(2.5, 2.5),
+                  cmap='Reds'):
+    """Show heatmaps of matrices.
+
+    Defined in :numref:`sec_attention-cues`"""
+    d2l.use_svg_display()
+    num_rows, num_cols = matrices.shape[0], matrices.shape[1]
+    fig, axes = d2l.plt.subplots(num_rows, num_cols, figsize=figsize,
+                                 sharex=True, sharey=True, squeeze=False)
+    for i, (row_axes, row_matrices) in enumerate(zip(axes, matrices)):
+        for j, (ax, matrix) in enumerate(zip(row_axes, row_matrices)):
+            pcm = ax.imshow(d2l.numpy(matrix), cmap=cmap)
+            if i == num_rows - 1:
+                ax.set_xlabel(xlabel)
+            if j == 0:
+                ax.set_ylabel(ylabel)
+            if titles:
+                ax.set_title(titles[j])
+    fig.colorbar(pcm, ax=axes, shrink=0.6);
+
+def masked_softmax(X, valid_lens):
+    """Perform softmax operation by masking elements on the last axis.
+
+    Defined in :numref:`sec_attention-scoring-functions`"""
+    # `X`: 3D tensor, `valid_lens`: 1D or 2D tensor
+    if valid_lens is None:
+        return tf.nn.softmax(X, axis=-1)
+    else:
+        shape = X.shape
+        if len(valid_lens.shape) == 1:
+            valid_lens = tf.repeat(valid_lens, repeats=shape[1])
+
+        else:
+            valid_lens = tf.reshape(valid_lens, shape=-1)
+        # On the last axis, replace masked elements with a very large negative
+        # value, whose exponentiation outputs 0
+        X = d2l.sequence_mask(tf.reshape(X, shape=(-1, shape[-1])), valid_lens, value=-1e6)
+        return tf.nn.softmax(tf.reshape(X, shape=shape), axis=-1)
+
+class AdditiveAttention(tf.keras.layers.Layer):
+    """Additive attention.
+
+    Defined in :numref:`sec_attention-scoring-functions`"""
+    def __init__(self, key_size, query_size, num_hiddens, dropout, **kwargs):
+        super().__init__(**kwargs)
+        self.W_k = tf.keras.layers.Dense(num_hiddens, use_bias=False)
+        self.W_q = tf.keras.layers.Dense(num_hiddens, use_bias=False)
+        self.w_v = tf.keras.layers.Dense(1, use_bias=False)
+        self.dropout = tf.keras.layers.Dropout(dropout)
+
+    def call(self, queries, keys, values, valid_lens, **kwargs):
+        queries, keys = self.W_q(queries), self.W_k(keys)
+        # After dimension expansion, shape of `queries`: (`batch_size`, no. of
+        # queries, 1, `num_hiddens`) and shape of `keys`: (`batch_size`, 1,
+        # no. of key-value pairs, `num_hiddens`). Sum them up with
+        # broadcasting
+        features = tf.expand_dims(queries, axis=2) + tf.expand_dims(
+            keys, axis=1)
+        features = tf.nn.tanh(features)
+        # There is only one output of `self.w_v`, so we remove the last
+        # one-dimensional entry from the shape. Shape of `scores`:
+        # (`batch_size`, no. of queries, no. of key-value pairs)
+        scores = tf.squeeze(self.w_v(features), axis=-1)
+        self.attention_weights = masked_softmax(scores, valid_lens)
+        # Shape of `values`: (`batch_size`, no. of key-value pairs, value
+        # dimension)
+        return tf.matmul(self.dropout(
+            self.attention_weights, **kwargs), values)
+
+class DotProductAttention(tf.keras.layers.Layer):
+    """Scaled dot product attention.
+
+    Defined in :numref:`subsec_additive-attention`"""
+    def __init__(self, dropout, **kwargs):
+        super().__init__(**kwargs)
+        self.dropout = tf.keras.layers.Dropout(dropout)
+
+    # Shape of `queries`: (`batch_size`, no. of queries, `d`)
+    # Shape of `keys`: (`batch_size`, no. of key-value pairs, `d`)
+    # Shape of `values`: (`batch_size`, no. of key-value pairs, value
+    # dimension)
+    # Shape of `valid_lens`: (`batch_size`,) or (`batch_size`, no. of queries)
+    def call(self, queries, keys, values, valid_lens, **kwargs):
+        d = queries.shape[-1]
+        scores = tf.matmul(queries, keys, transpose_b=True)/tf.math.sqrt(
+            tf.cast(d, dtype=tf.float32))
+        self.attention_weights = masked_softmax(scores, valid_lens)
+        return tf.matmul(self.dropout(self.attention_weights, **kwargs), values)
+
+class AttentionDecoder(d2l.Decoder):
+    """The base attention-based decoder interface.
+
+    Defined in :numref:`sec_seq2seq_attention`"""
+    def __init__(self, **kwargs):
+        super(AttentionDecoder, self).__init__(**kwargs)
+
+    @property
+    def attention_weights(self):
+        raise NotImplementedError
+
+class MultiHeadAttention(tf.keras.layers.Layer):
+    """Multi-head attention.
+
+    Defined in :numref:`sec_multihead-attention`"""
+    def __init__(self, key_size, query_size, value_size, num_hiddens,
+                 num_heads, dropout, bias=False, **kwargs):
+        super().__init__(**kwargs)
+        self.num_heads = num_heads
+        self.attention = d2l.DotProductAttention(dropout)
+        self.W_q = tf.keras.layers.Dense(num_hiddens, use_bias=bias)
+        self.W_k = tf.keras.layers.Dense(num_hiddens, use_bias=bias)
+        self.W_v = tf.keras.layers.Dense(num_hiddens, use_bias=bias)
+        self.W_o = tf.keras.layers.Dense(num_hiddens, use_bias=bias)
+
+    def call(self, queries, keys, values, valid_lens, **kwargs):
+        # Shape of `queries`, `keys`, or `values`:
+        # (`batch_size`, no. of queries or key-value pairs, `num_hiddens`)
+        # Shape of `valid_lens`:
+        # (`batch_size`,) or (`batch_size`, no. of queries)
+        # After transposing, shape of output `queries`, `keys`, or `values`:
+        # (`batch_size` * `num_heads`, no. of queries or key-value pairs,
+        # `num_hiddens` / `num_heads`)
+        queries = transpose_qkv(self.W_q(queries), self.num_heads)
+        keys = transpose_qkv(self.W_k(keys), self.num_heads)
+        values = transpose_qkv(self.W_v(values), self.num_heads)
+
+        if valid_lens is not None:
+            # On axis 0, copy the first item (scalar or vector) for
+            # `num_heads` times, then copy the next item, and so on
+            valid_lens = tf.repeat(valid_lens, repeats=self.num_heads, axis=0)
+
+        # Shape of `output`: (`batch_size` * `num_heads`, no. of queries, `num_hiddens` / `num_heads`)
+        output = self.attention(queries, keys, values, valid_lens, **kwargs)
+
+        # Shape of `output_concat`: (`batch_size`, no. of queries, `num_hiddens`)
+        output_concat = transpose_output(output, self.num_heads)
+        return self.W_o(output_concat)
+
+def transpose_qkv(X, num_heads):
+    """Transposition for parallel computation of multiple attention heads.
+
+    Defined in :numref:`sec_multihead-attention`"""
+    # Shape of input `X`:
+    # (`batch_size`, no. of queries or key-value pairs, `num_hiddens`).
+    # Shape of output `X`:
+    # (`batch_size`, no. of queries or key-value pairs, `num_heads`,
+    # `num_hiddens` / `num_heads`)
+    X = tf.reshape(X, shape=(X.shape[0], X.shape[1], num_heads, -1))
+
+    # Shape of output `X`:
+    # (`batch_size`, `num_heads`, no. of queries or key-value pairs,
+    # `num_hiddens` / `num_heads`)
+    X = tf.transpose(X, perm=(0, 2, 1, 3))
+
+    # Shape of `output`:
+    # (`batch_size` * `num_heads`, no. of queries or key-value pairs,
+    # `num_hiddens` / `num_heads`)
+    return tf.reshape(X, shape=(-1, X.shape[2], X.shape[3]))
+
+
+def transpose_output(X, num_heads):
+    """Reverse the operation of `transpose_qkv`.
+
+    Defined in :numref:`sec_multihead-attention`"""
+    X = tf.reshape(X, shape=(-1, num_heads, X.shape[1], X.shape[2]))
+    X = tf.transpose(X, perm=(0, 2, 1, 3))
+    return tf.reshape(X, shape=(X.shape[0], X.shape[1], -1))
+
+class PositionalEncoding(tf.keras.layers.Layer):
+    """Positional encoding.
+
+    Defined in :numref:`sec_self-attention-and-positional-encoding`"""
+    def __init__(self, num_hiddens, dropout, max_len=1000):
+        super().__init__()
+        self.dropout = tf.keras.layers.Dropout(dropout)
+        # Create a long enough `P`
+        self.P = np.zeros((1, max_len, num_hiddens))
+        X = np.arange(max_len, dtype=np.float32).reshape(
+            -1,1)/np.power(10000, np.arange(
+            0, num_hiddens, 2, dtype=np.float32) / num_hiddens)
+        self.P[:, :, 0::2] = np.sin(X)
+        self.P[:, :, 1::2] = np.cos(X)
+
+    def call(self, X, **kwargs):
+        X = X + self.P[:, :X.shape[1], :]
+        return self.dropout(X, **kwargs)
+
+class PositionWiseFFN(tf.keras.layers.Layer):
+    """Positionwise feed-forward network.
+
+    Defined in :numref:`sec_transformer`"""
+    def __init__(self, ffn_num_hiddens, ffn_num_outputs, **kwargs):
+        super().__init__(*kwargs)
+        self.dense1 = tf.keras.layers.Dense(ffn_num_hiddens)
+        self.relu = tf.keras.layers.ReLU()
+        self.dense2 = tf.keras.layers.Dense(ffn_num_outputs)
+
+    def call(self, X):
+        return self.dense2(self.relu(self.dense1(X)))
+
+class AddNorm(tf.keras.layers.Layer):
+    """Residual connection followed by layer normalization.
+
+    Defined in :numref:`sec_transformer`"""
+    def __init__(self, normalized_shape, dropout, **kwargs):
+        super().__init__(**kwargs)
+        self.dropout = tf.keras.layers.Dropout(dropout)
+        self.ln = tf.keras.layers.LayerNormalization(normalized_shape)
+
+    def call(self, X, Y, **kwargs):
+        return self.ln(self.dropout(Y, **kwargs) + X)
+
+class EncoderBlock(tf.keras.layers.Layer):
+    """Transformer encoder block.
+
+    Defined in :numref:`sec_transformer`"""
+    def __init__(self, key_size, query_size, value_size, num_hiddens,
+                 norm_shape, ffn_num_hiddens, num_heads, dropout, bias=False, **kwargs):
+        super().__init__(**kwargs)
+        self.attention = d2l.MultiHeadAttention(key_size, query_size, value_size, num_hiddens,
+                                                num_heads, dropout, bias)
+        self.addnorm1 = AddNorm(norm_shape, dropout)
+        self.ffn = PositionWiseFFN(ffn_num_hiddens, num_hiddens)
+        self.addnorm2 = AddNorm(norm_shape, dropout)
+
+    def call(self, X, valid_lens, **kwargs):
+        Y = self.addnorm1(X, self.attention(X, X, X, valid_lens, **kwargs), **kwargs)
+        return self.addnorm2(Y, self.ffn(Y), **kwargs)
+
+class TransformerEncoder(d2l.Encoder):
+    """Transformer encoder.
+
+    Defined in :numref:`sec_transformer`"""
+    def __init__(self, vocab_size, key_size, query_size, value_size,
+                 num_hiddens, norm_shape, ffn_num_hiddens, num_heads,
+                 num_layers, dropout, bias=False, **kwargs):
+        super().__init__(**kwargs)
+        self.num_hiddens = num_hiddens
+        self.embedding = tf.keras.layers.Embedding(vocab_size, num_hiddens)
+        self.pos_encoding = d2l.PositionalEncoding(num_hiddens, dropout)
+        self.blks = [EncoderBlock(
+            key_size, query_size, value_size, num_hiddens, norm_shape,
+            ffn_num_hiddens, num_heads, dropout, bias) for _ in range(
+            num_layers)]
+
+    def call(self, X, valid_lens, **kwargs):
+        # Since positional encoding values are between -1 and 1, the embedding
+        # values are multiplied by the square root of the embedding dimension
+        # to rescale before they are summed up
+        X = self.pos_encoding(self.embedding(X) * tf.math.sqrt(
+            tf.cast(self.num_hiddens, dtype=tf.float32)), **kwargs)
+        self.attention_weights = [None] * len(self.blks)
+        for i, blk in enumerate(self.blks):
+            X = blk(X, valid_lens, **kwargs)
+            self.attention_weights[
+                i] = blk.attention.attention.attention_weights
+        return X
+
+def annotate(text, xy, xytext):
+    d2l.plt.gca().annotate(text, xy=xy, xytext=xytext,
+                           arrowprops=dict(arrowstyle='->'))
+
+def train_2d(trainer, steps=20, f_grad=None):
+    """Optimize a 2D objective function with a customized trainer.
+
+    Defined in :numref:`subsec_gd-learningrate`"""
+    # `s1` and `s2` are internal state variables that will be used later
+    x1, x2, s1, s2 = -5, -2, 0, 0
+    results = [(x1, x2)]
+    for i in range(steps):
+        if f_grad:
+            x1, x2, s1, s2 = trainer(x1, x2, s1, s2, f_grad)
+        else:
+            x1, x2, s1, s2 = trainer(x1, x2, s1, s2)
+        results.append((x1, x2))
+    print(f'epoch {i + 1}, x1: {float(x1):f}, x2: {float(x2):f}')
+    return results
+
+def show_trace_2d(f, results):
+    """Show the trace of 2D variables during optimization.
+
+    Defined in :numref:`subsec_gd-learningrate`"""
+    d2l.set_figsize()
+    d2l.plt.plot(*zip(*results), '-o', color='#ff7f0e')
+    x1, x2 = d2l.meshgrid(d2l.arange(-5.5, 1.0, 0.1),
+                          d2l.arange(-3.0, 1.0, 0.1))
+    d2l.plt.contour(x1, x2, f(x1, x2), colors='#1f77b4')
+    d2l.plt.xlabel('x1')
+    d2l.plt.ylabel('x2')
+
+d2l.DATA_HUB['airfoil'] = (d2l.DATA_URL + 'airfoil_self_noise.dat',
+                           '76e5be1548fd8222e5074cf0faae75edff8cf93f')
+
+def get_data_ch11(batch_size=10, n=1500):
+    """Defined in :numref:`sec_minibatches`"""
+    data = np.genfromtxt(d2l.download('airfoil'),
+                         dtype=np.float32, delimiter='\t')
+    data = (data - data.mean(axis=0)) / data.std(axis=0)
+    data_iter = d2l.load_array((data[:n, :-1], data[:n, -1]),
+                               batch_size, is_train=True)
+    return data_iter, data.shape[1]-1
+
+def train_ch11(trainer_fn, states, hyperparams, data_iter,
+               feature_dim, num_epochs=2):
+    """Defined in :numref:`sec_minibatches`"""
+    # Initialization
+    w = tf.Variable(tf.random.normal(shape=(feature_dim, 1),
+                                   mean=0, stddev=0.01),trainable=True)
+    b = tf.Variable(tf.zeros(1), trainable=True)
+
+    # Train
+    net, loss = lambda X: d2l.linreg(X, w, b), d2l.squared_loss
+    animator = d2l.Animator(xlabel='epoch', ylabel='loss',
+                            xlim=[0, num_epochs], ylim=[0.22, 0.35])
+    n, timer = 0, d2l.Timer()
+
+    for _ in range(num_epochs):
+        for X, y in data_iter:
+          with tf.GradientTape() as g:
+            l = tf.math.reduce_mean(loss(net(X), y))
+
+          dw, db = g.gradient(l, [w, b])
+          trainer_fn([w, b], [dw, db], states, hyperparams)
+          n += X.shape[0]
+          if n % 200 == 0:
+              timer.stop()
+              p = n/X.shape[0]
+              q = p/tf.data.experimental.cardinality(data_iter).numpy()
+              r = (d2l.evaluate_loss(net, data_iter, loss),)
+              animator.add(q, r)
+              timer.start()
+    print(f'loss: {animator.Y[0][-1]:.3f}, {timer.avg():.3f} sec/epoch')
+    return timer.cumsum(), animator.Y[0]
+
+def train_concise_ch11(trainer_fn, hyperparams, data_iter, num_epochs=2):
+    """Defined in :numref:`sec_minibatches`"""
+    # Initialization
+    net = tf.keras.Sequential()
+    net.add(tf.keras.layers.Dense(1,
+            kernel_initializer=tf.random_normal_initializer(stddev=0.01)))
+    optimizer = trainer_fn(**hyperparams)
+    # Note: `MeanSquaredError` computes squared error without the 1/2 factor
+    loss = tf.keras.losses.MeanSquaredError()
+    animator = d2l.Animator(xlabel='epoch', ylabel='loss',
+                            xlim=[0, num_epochs], ylim=[0.22, 0.35])
+    n, timer = 0, d2l.Timer()
+    for _ in range(num_epochs):
+        for X, y in data_iter:
+            with tf.GradientTape() as g:
+                out = net(X)
+                l = loss(y, out)
+                params = net.trainable_variables
+                grads = g.gradient(l, params)
+            optimizer.apply_gradients(zip(grads, params))
+            n += X.shape[0]
+            if n % 200 == 0:
+                timer.stop()
+                p = n/X.shape[0]
+                q = p/tf.data.experimental.cardinality(data_iter).numpy()
+                r = (d2l.evaluate_loss(net, data_iter, loss),)
+                animator.add(q, r)
+                timer.start()
+    print(f'loss: {animator.Y[0][-1]:.3f}, {timer.avg():.3f} sec/epoch')
+
+class Benchmark:
+    """For measuring running time."""
+    def __init__(self, description='Done'):
+        """Defined in :numref:`sec_hybridize`"""
+        self.description = description
+
+    def __enter__(self):
+        self.timer = d2l.Timer()
+        return self
+
+    def __exit__(self, *args):
+        print(f'{self.description}: {self.timer.stop():.4f} sec')
+
+def box_corner_to_center(boxes):
+    """Convert from (upper-left, lower-right) to (center, width, height).
+
+    Defined in :numref:`sec_bbox`"""
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    w = x2 - x1
+    h = y2 - y1
+    boxes = d2l.stack((cx, cy, w, h), axis=-1)
+    return boxes
+
+def box_center_to_corner(boxes):
+    """Convert from (center, width, height) to (upper-left, lower-right).
+
+    Defined in :numref:`sec_bbox`"""
+    cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    x1 = cx - 0.5 * w
+    y1 = cy - 0.5 * h
+    x2 = cx + 0.5 * w
+    y2 = cy + 0.5 * h
+    boxes = d2l.stack((x1, y1, x2, y2), axis=-1)
+    return boxes
+
+def bbox_to_rect(bbox, color):
+    """Convert bounding box to matplotlib format.
+
+    Defined in :numref:`sec_bbox`"""
+    # Convert the bounding box (upper-left x, upper-left y, lower-right x,
+    # lower-right y) format to the matplotlib format: ((upper-left x,
+    # upper-left y), width, height)
+    return d2l.plt.Rectangle(
+        xy=(bbox[0], bbox[1]), width=bbox[2]-bbox[0], height=bbox[3]-bbox[1],
+        fill=False, edgecolor=color, linewidth=2)# Alias defined in config.ini
 size = lambda a: tf.size(a).numpy()
 
 reshape = tf.reshape

@@ -525,7 +525,7 @@ as the current input to the decoder.
 
 ```{.python .input}
 #@save
-def train_s2s_ch9(model, data_iter, lr, num_epochs, tgt_vocab, device):
+def train_seq2seq(model, data_iter, lr, num_epochs, tgt_vocab, device):
     """Train a model for sequence to sequence (defined in Chapter 9)."""
     model.initialize(init.Xavier(), force_reinit=True, ctx=device)
     trainer = gluon.Trainer(model.collect_params(), 'adam',
@@ -559,7 +559,7 @@ def train_s2s_ch9(model, data_iter, lr, num_epochs, tgt_vocab, device):
 ```{.python .input}
 #@tab pytorch
 #@save
-def train_s2s_ch9(model, data_iter, lr, num_epochs, tgt_vocab, device):
+def train_seq2seq(model, data_iter, lr, num_epochs, tgt_vocab, device):
     """Train a model for sequence to sequence (defined in Chapter 9)."""
     def xavier_init_weights(m):
         if type(m) == nn.Linear:
@@ -612,7 +612,7 @@ encoder = Seq2SeqEncoder(
 decoder = Seq2SeqDecoder(
     len(tgt_vocab), embed_size, num_hiddens, num_layers, dropout)
 model = d2l.EncoderDecoder(encoder, decoder)
-train_s2s_ch9(model, train_iter, lr, num_epochs, tgt_vocab, device)
+train_seq2seq(model, train_iter, lr, num_epochs, tgt_vocab, device)
 ```
 
 ## Prediction
@@ -641,42 +641,45 @@ strategies for sequence generation in
 
 ```{.python .input}
 #@save
-def predict_s2s_ch9(model, src_sentence, src_vocab, tgt_vocab, num_steps,
-                    device):
-    """Predict sequences (defined in Chapter 9)."""
+def predict_seq2seq(net, src_sentence, src_vocab, tgt_vocab, num_steps,
+                    device, save_attention_weights=False):
+    """Predict for sequence to sequence."""
     src_tokens = src_vocab[src_sentence.lower().split(' ')] + [
         src_vocab['<eos>']]
     enc_valid_len = np.array([len(src_tokens)], ctx=device)
     src_tokens = d2l.truncate_pad(src_tokens, num_steps, src_vocab['<pad>'])
     # Add the batch axis
     enc_X = np.expand_dims(np.array(src_tokens, ctx=device), axis=0)
-    enc_outputs = model.encoder(enc_X, enc_valid_len)
-    dec_state = model.decoder.init_state(enc_outputs, enc_valid_len)
+    enc_outputs = net.encoder(enc_X, enc_valid_len)
+    dec_state = net.decoder.init_state(enc_outputs, enc_valid_len)
     # Add the batch axis
     dec_X = np.expand_dims(np.array([tgt_vocab['<bos>']], ctx=device), axis=0)
-    output_seq = []
+    output_seq, attention_weight_seq = [], []
     for _ in range(num_steps):
-        Y, dec_state = model.decoder(dec_X, dec_state)
+        Y, dec_state = net.decoder(dec_X, dec_state)
         # We use the token with the highest prediction likelihood as the input
         # of the decoder at the next time step
         dec_X = Y.argmax(axis=2)
         pred = dec_X.squeeze(axis=0).astype('int32').item()
-        # Once the end-of-sequence token is predicted, the generation of
-        # the output sequence is complete
+        # Save attention weights (to be covered later)
+        if save_attention_weights:
+            attention_weight_seq.append(net.decoder.attention_weights)
+        # Once the end-of-sequence token is predicted, the generation of the
+        # output sequence is complete
         if pred == tgt_vocab['<eos>']:
             break
         output_seq.append(pred)
-    return ' '.join(tgt_vocab.to_tokens(output_seq))
+    return ' '.join(tgt_vocab.to_tokens(output_seq)), attention_weight_seq
 ```
 
 ```{.python .input}
 #@tab pytorch
 #@save
-def predict_s2s_ch9(model, src_sentence, src_vocab, tgt_vocab, num_steps,
-                    device):
-    """Predict sequences (defined in Chapter 9)."""
-    # Set model to eval mode for inference
-    model.eval()
+def predict_seq2seq(net, src_sentence, src_vocab, tgt_vocab, num_steps,
+                    device, save_attention_weights=False):
+    """Predict for sequence to sequence."""
+    # Set `net` to eval mode for inference
+    net.eval()
     src_tokens = src_vocab[src_sentence.lower().split(' ')] + [
         src_vocab['<eos>']]
     enc_valid_len = torch.tensor([len(src_tokens)], device=device)
@@ -684,24 +687,27 @@ def predict_s2s_ch9(model, src_sentence, src_vocab, tgt_vocab, num_steps,
     # Add the batch axis
     enc_X = torch.unsqueeze(
         torch.tensor(src_tokens, dtype=torch.long, device=device), dim=0)
-    enc_outputs = model.encoder(enc_X, enc_valid_len)
-    dec_state = model.decoder.init_state(enc_outputs, enc_valid_len)
+    enc_outputs = net.encoder(enc_X, enc_valid_len)
+    dec_state = net.decoder.init_state(enc_outputs, enc_valid_len)
     # Add the batch axis
     dec_X = torch.unsqueeze(torch.tensor(
         [tgt_vocab['<bos>']], dtype=torch.long, device=device), dim=0)
-    output_seq = []
+    output_seq, attention_weight_seq = [], []
     for _ in range(num_steps):
-        Y, dec_state = model.decoder(dec_X, dec_state)
+        Y, dec_state = net.decoder(dec_X, dec_state)
         # We use the token with the highest prediction likelihood as the input
         # of the decoder at the next time step
         dec_X = Y.argmax(dim=2)
         pred = dec_X.squeeze(dim=0).type(torch.int32).item()
-        # Once the end-of-sequence token is predicted, the generation of
-        # the output sequence is complete
+        # Save attention weights (to be covered later)
+        if save_attention_weights:
+            attention_weight_seq.append(net.decoder.attention_weights)
+        # Once the end-of-sequence token is predicted, the generation of the
+        # output sequence is complete
         if pred == tgt_vocab['<eos>']:
             break
         output_seq.append(pred)
-    return ' '.join(tgt_vocab.to_tokens(output_seq))
+    return ' '.join(tgt_vocab.to_tokens(output_seq)), attention_weight_seq
 ```
 
 ## Evaluation of Predicted Sequences
@@ -791,7 +797,7 @@ and compute the BLEU of the results.
 def translate(engs, fras, model, src_vocab, tgt_vocab, num_steps, device):
     """Translate text sequences."""
     for eng, fra in zip(engs, fras):
-        translation = predict_s2s_ch9(
+        translation = predict_seq2seq(
             model, eng, src_vocab, tgt_vocab, num_steps, device)
         print(
             f'{eng} => {translation}, bleu {bleu(translation, fra, k=2):.3f}')
